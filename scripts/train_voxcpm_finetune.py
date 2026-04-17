@@ -126,7 +126,11 @@ def train(
         val_texts = list(val_ds["text"])  # Save original texts
         val_ds = val_ds.map(tokenize, batched=True, remove_columns=["text"])
 
-    dataset_cnt = int(max(train_ds["dataset_id"])) + 1 if "dataset_id" in train_ds.column_names else 1
+    if "dataset_id" in train_ds.column_names:
+        _ids = [x for x in train_ds["dataset_id"] if x is not None]
+        dataset_cnt = int(max(_ids)) + 1 if _ids else 1
+    else:
+        dataset_cnt = 1
     num_train_samples = len(train_ds)
 
     # ------------------------------------------------------------------ #

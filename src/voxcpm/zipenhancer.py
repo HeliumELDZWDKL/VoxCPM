@@ -8,7 +8,39 @@ Related dependencies are imported only when denoising functionality is needed.
 import os
 import tempfile
 from typing import Optional
+import torch
+import soundfile as sf
 import torchaudio
+
+# torchaudio >= 2.11 forces torchcodec which is unavailable on Windows.
+# Replace torchaudio.load/save globally with soundfile-based implementations
+# so that modelscope pipeline internals also use soundfile.
+
+def _sf_load(uri, frame_offset=0, num_frames=-1, normalize=True,
+             channels_first=True, format=None, buffer_size=4096, backend=None):
+    """Drop-in replacement for torchaudio.load using soundfile."""
+    data, sr = sf.read(uri, start=frame_offset,
+                       stop=frame_offset + num_frames if num_frames > 0 else None,
+                       dtype='float32', always_2d=True)
+    # data shape: (samples, channels) -> torch (channels, samples)
+    tensor = torch.from_numpy(data.T)
+    if not channels_first:
+        tensor = tensor.T
+    return tensor, sr
+
+def _sf_save(uri, src, sample_rate, channels_first=True, format=None,
+             encoding=None, bits_per_sample=None, buffer_size=4096, backend=None,
+             compression=None):
+    """Drop-in replacement for torchaudio.save using soundfile."""
+    if channels_first:
+        data = src.cpu().numpy().T  # (channels, samples) -> (samples, channels)
+    else:
+        data = src.cpu().numpy()
+    sf.write(uri, data, sample_rate)
+
+torchaudio.load = _sf_load
+torchaudio.save = _sf_save
+
 from modelscope.pipelines import pipeline
 from modelscope.utils.constant import Tasks
 

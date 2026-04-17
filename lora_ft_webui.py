@@ -14,10 +14,16 @@ from typing import Optional
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root / "src"))
 
-# Default pretrained model path: prefer VoxCPM2 if it exists, fallback to VoxCPM1.5
-_v2_path = project_root / "models" / "openbmb__VoxCPM2"
-_v15_path = project_root / "models" / "openbmb__VoxCPM1.5"
-default_pretrained_path = str(_v2_path if _v2_path.exists() else _v15_path)
+# Default pretrained model path: use relative paths for compatibility with from_pretrained
+# (absolute paths cause "Repo id must use alphanumeric chars" errors)
+_v2_rel = "models/VoxCPM2"
+_v2_hf_rel = "models/openbmb__VoxCPM2"
+_v15_rel = "models/openbmb__VoxCPM1.5"
+default_pretrained_path = (
+    _v2_rel if (project_root / _v2_rel).exists()
+    else _v2_hf_rel if (project_root / _v2_hf_rel).exists()
+    else _v15_rel
+)
 
 from voxcpm.core import VoxCPM
 from voxcpm.model.voxcpm import LoRAConfig
@@ -49,7 +55,7 @@ LANG_DICT = {
         "select_lora": "Select LoRA Checkpoint",
         "cfg_scale": "CFG Scale",
         "infer_steps": "Inference Steps",
-        "seed": "Seed",
+
         "gen_audio": "Generate Audio",
         "gen_output": "Generated Audio",
         "status": "Status",
@@ -80,7 +86,7 @@ LANG_DICT = {
         "select_lora": "选择 LoRA 模型",
         "cfg_scale": "CFG Scale (引导系数)",
         "infer_steps": "推理步数",
-        "seed": "随机种子 (Seed)",
+
         "gen_audio": "生成音频",
         "gen_output": "生成结果",
         "status": "状态",
@@ -252,7 +258,8 @@ def load_model(pretrained_path, lora_path=None):
     return "Model loaded successfully!"
 
 
-def run_inference(text, prompt_wav, prompt_text, lora_selection, cfg_scale, steps, seed, pretrained_path=None):
+def run_inference(text, prompt_wav, prompt_text, lora_selection, cfg_scale, steps, pretrained_path=None):
+    global current_model
     # 如果选择了 LoRA 模型且当前模型未加载，尝试从 LoRA config 读取 base_model
     if current_model is None:
         # 优先使用用户指定的预训练模型路径
@@ -280,35 +287,57 @@ def run_inference(text, prompt_wav, prompt_text, lora_selection, cfg_scale, step
                 except Exception as e:
                     print(f"Warning: Failed to read base_model from LoRA config: {e}", file=sys.stderr)
 
-        # 加载模型
+        # 加载模型（带上 LoRA 路径，以便从 lora_config.json 读取正确的 r/alpha 等参数）
+        lora_to_load = lora_selection if (lora_selection and lora_selection != "None") else None
         try:
             print(f"Loading base model: {base_model_path}", file=sys.stderr)
-            load_model(base_model_path)
-            if lora_selection and lora_selection != "None":
-                print(f"Model loaded for LoRA: {lora_selection}", file=sys.stderr)
+            load_model(base_model_path, lora_path=lora_to_load)
+            if lora_to_load:
+                print(f"Model loaded with LoRA config from: {lora_to_load}", file=sys.stderr)
         except Exception as e:
             error_msg = f"Failed to load model from {base_model_path}: {str(e)}"
             print(error_msg, file=sys.stderr)
             return None, error_msg
 
-    # Handle LoRA hot-swapping
+    # Handle LoRA hot-swapping (with automatic rank mismatch detection)
     assert current_model is not None, "Model must be loaded before inference"
     if lora_selection and lora_selection != "None":
         full_lora_path = os.path.join("lora", lora_selection)
         print(f"Hot-loading LoRA: {full_lora_path}", file=sys.stderr)
         try:
-            current_model.load_lora(full_lora_path)
-            current_model.set_lora_enabled(True)
+            # Check if LoRA rank matches current model
+            new_lora_cfg, _ = load_lora_config_from_checkpoint(full_lora_path)
+            current_rank = getattr(current_model.tts_model, 'lora_config', None)
+            current_r = current_rank.r if current_rank else None
+            new_r = new_lora_cfg.r if new_lora_cfg else None
+
+            if new_r and current_r != new_r:
+                print(f"LoRA rank mismatch: model has r={current_r}, LoRA needs r={new_r}. Reloading model...", file=sys.stderr)
+                base_path = pretrained_path if pretrained_path and pretrained_path.strip() else default_pretrained_path
+                # Try to read base_model from LoRA config
+                lora_config_file = os.path.join(full_lora_path, "lora_config.json")
+                if os.path.exists(lora_config_file):
+                    try:
+                        with open(lora_config_file, "r", encoding="utf-8") as f:
+                            lora_info = json.load(f)
+                        saved_base = lora_info.get("base_model")
+                        if saved_base and os.path.exists(saved_base):
+                            base_path = saved_base
+                    except Exception:
+                        pass
+                current_model = None
+                import torch; torch.cuda.empty_cache()
+                load_model(base_path, lora_path=lora_selection)
+                print(f"Model reloaded with r={new_r}", file=sys.stderr)
+            else:
+                current_model.load_lora(full_lora_path)
+                current_model.set_lora_enabled(True)
         except Exception as e:
             print(f"Error loading LoRA: {e}", file=sys.stderr)
             return None, f"Error loading LoRA: {e}"
     else:
         print("Disabling LoRA", file=sys.stderr)
         current_model.set_lora_enabled(False)
-
-    if seed != -1:
-        torch.manual_seed(seed)
-        np.random.seed(seed)
 
     # 处理 prompt 参数：必须同时为 None 或同时有值
     final_prompt_wav = None
@@ -1095,14 +1124,6 @@ with gr.Blocks(title="VoxCPM LoRA WebUI", theme=gr.themes.Soft(), css=custom_css
                         info="生成质量与步数成正比，但耗时更长",
                     )
 
-                    seed = gr.Number(
-                        label="🎲 随机种子",
-                        value=-1,
-                        precision=0,
-                        elem_classes="input-field",
-                        info="-1 为随机，固定值可复现结果",
-                    )
-
                     generate_btn = gr.Button("🎵 生成音频", variant="primary", elem_classes="button-primary", size="lg")
 
                 # 右栏：生成结果 (30%)
@@ -1151,7 +1172,6 @@ with gr.Blocks(title="VoxCPM LoRA WebUI", theme=gr.themes.Soft(), css=custom_css
                     lora_select,
                     cfg_scale,
                     steps,
-                    seed,
                     train_pretrained_path,
                 ],
                 outputs=[audio_out, status_out],
@@ -1243,7 +1263,6 @@ with gr.Blocks(title="VoxCPM LoRA WebUI", theme=gr.themes.Soft(), css=custom_css
             gr.update(value=d["refresh"]),
             gr.update(label=d["cfg_scale"]),
             gr.update(label=d["infer_steps"]),
-            gr.update(label=d["seed"]),
             gr.update(value=d["gen_audio"]),
             gr.update(label=d["gen_output"]),
             gr.update(label=d["status"]),
@@ -1294,7 +1313,6 @@ with gr.Blocks(title="VoxCPM LoRA WebUI", theme=gr.themes.Soft(), css=custom_css
             refresh_lora_btn,
             cfg_scale,
             steps,
-            seed,
             generate_btn,
             audio_out,
             status_out,

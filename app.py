@@ -1,16 +1,19 @@
 import os
+import re
 import sys
+import json
 import logging
 import numpy as np
 import torch
 import gradio as gr
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from funasr import AutoModel
 from pathlib import Path
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import voxcpm
+from voxcpm.model.voxcpm import LoRAConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,6 +117,13 @@ _I18N_TRANSLATIONS = {
         "cfg_info": "Higher → closer to the prompt / reference; lower → more creative variation",
         "dit_steps_label": "LocDiT flow-matching steps",
         "dit_steps_info": "LocDiT flow-matching steps — more steps → maybe better audio quality, but slower",
+        "audio_sr_label": "Audio Super-Resolution (AP-BWE)",
+        "audio_sr_info": "Rebuild high-frequency details via bandwidth extension (48k→24k→48k). Helps reduce blurriness in long texts",
+        "seg_mode_label": "Segmented Generation Mode",
+        "seg_mode_none": "Disabled (whole text)",
+        "seg_mode_clear": "Clear KV cache per sentence",
+        "seg_mode_lookback": "Lookback 1 sentence KV cache",
+        "seg_mode_info": "Controls how KV cache is handled during segmented generation to balance quality and prosody continuity",
         "usage_instructions": _USAGE_INSTRUCTIONS_EN,
         "examples_footer": _EXAMPLES_FOOTER_EN,
     },
@@ -137,6 +147,13 @@ _I18N_TRANSLATIONS = {
         "cfg_info": "数值越高 → 越贴合提示/参考音色；数值越低 → 生成风格更自由",
         "dit_steps_label": "LocDiT 流匹配迭代步数",
         "dit_steps_info": "LocDiT 流匹配生成迭代步数 — 步数越多 → 可能生成更好的音频质量，但速度变慢",
+        "audio_sr_label": "音频超分辨率 (AP-BWE)",
+        "audio_sr_info": "通过带宽扩展重建高频细节 (48k→24k→48k)，可改善长文本后半段音质模糊的问题",
+        "seg_mode_label": "分段生成模式",
+        "seg_mode_none": "不分段（整段生成）",
+        "seg_mode_clear": "每句清除 KV Cache",
+        "seg_mode_lookback": "回看一句 KV Cache",
+        "seg_mode_info": "控制分段生成时 KV Cache 的处理方式，平衡音质与语调连贯性",
         "usage_instructions": _USAGE_INSTRUCTIONS_ZH,
         "examples_footer": _EXAMPLES_FOOTER_ZH,
     },
@@ -216,6 +233,46 @@ _APP_THEME = gr.themes.Soft(
 )
 
 
+# ---------- LoRA Helpers ----------
+
+def get_default_lora_config():
+    """Return default LoRA config so the model supports hot-swapping later."""
+    return LoRAConfig(
+        enable_lm=True,
+        enable_dit=True,
+        r=32,
+        alpha=16,
+        target_modules_lm=["q_proj", "v_proj", "k_proj", "o_proj"],
+        target_modules_dit=["q_proj", "v_proj", "k_proj", "o_proj"],
+    )
+
+
+def scan_lora_checkpoints(root_dir="lora"):
+    """Scan for LoRA checkpoints under *root_dir* and return sorted list of relative paths."""
+    checkpoints = []
+    if not os.path.exists(root_dir):
+        os.makedirs(root_dir, exist_ok=True)
+    for root, _dirs, files in os.walk(root_dir):
+        if "lora_weights.safetensors" in files:
+            checkpoints.append(os.path.relpath(root, root_dir))
+    return sorted(checkpoints, reverse=True)
+
+
+def load_lora_config_from_checkpoint(lora_path):
+    """Try to load LoRA config from lora_config.json inside *lora_path*."""
+    cfg_file = os.path.join(lora_path, "lora_config.json")
+    if os.path.exists(cfg_file):
+        try:
+            with open(cfg_file, "r", encoding="utf-8") as f:
+                info = json.load(f)
+            cfg_dict = info.get("lora_config", {})
+            if cfg_dict:
+                return LoRAConfig(**cfg_dict), info.get("base_model")
+        except Exception as e:
+            logger.warning(f"Failed to load lora_config.json: {e}")
+    return None, None
+
+
 # ---------- Model ----------
 
 class VoxCPMDemo:
@@ -233,14 +290,58 @@ class VoxCPMDemo:
 
         self.voxcpm_model: Optional[voxcpm.VoxCPM] = None
         self._model_id = model_id
+        self._current_lora: Optional[str] = None  # currently loaded LoRA path
+        self._current_lora_rank: Optional[int] = None  # rank of current LoRA config
 
-    def get_or_load_voxcpm(self) -> voxcpm.VoxCPM:
+    def get_or_load_voxcpm(self, lora_config=None, optimize=True) -> voxcpm.VoxCPM:
         if self.voxcpm_model is not None:
             return self.voxcpm_model
-        logger.info(f"Loading model: {self._model_id}")
-        self.voxcpm_model = voxcpm.VoxCPM.from_pretrained(self._model_id, optimize=True)
-        logger.info("Model loaded successfully.")
+        if lora_config is None:
+            lora_config = get_default_lora_config()
+        logger.info(f"Loading model: {self._model_id} (LoRA r={lora_config.r}, optimize={optimize})")
+        self.voxcpm_model = voxcpm.VoxCPM.from_pretrained(
+            self._model_id,
+            optimize=optimize,
+            lora_config=lora_config,
+        )
+        self._current_lora_rank = lora_config.r
+        logger.info("Model loaded successfully (with LoRA support).")
         return self.voxcpm_model
+
+    def _reload_model_with_config(self, lora_config) -> None:
+        """Reload model with a different LoRA config (when rank changes)."""
+        logger.info(f"Rank changed ({self._current_lora_rank} -> {lora_config.r}), reloading model...")
+        del self.voxcpm_model
+        self.voxcpm_model = None
+        self._current_lora = None
+        self._current_lora_rank = None
+        torch.cuda.empty_cache()
+        # optimize=False to avoid CUDA Graph state conflict on reload
+        self.get_or_load_voxcpm(lora_config=lora_config, optimize=False)
+
+    def swap_lora(self, lora_selection: Optional[str]) -> None:
+        """Hot-swap LoRA weights. Auto-reloads model if rank changes."""
+        model = self.get_or_load_voxcpm()
+        if not lora_selection or lora_selection == "None":
+            if self._current_lora is not None:
+                logger.info("Disabling LoRA")
+                model.set_lora_enabled(False)
+                self._current_lora = None
+            return
+        full_path = os.path.join("lora", lora_selection)
+        if full_path != self._current_lora:
+            # Read LoRA config to check rank compatibility
+            lora_cfg, _ = load_lora_config_from_checkpoint(full_path)
+            if lora_cfg is None:
+                lora_cfg = get_default_lora_config()
+            # If rank differs, must reload entire model
+            if self._current_lora_rank != lora_cfg.r:
+                self._reload_model_with_config(lora_cfg)
+                model = self.voxcpm_model
+            logger.info(f"Loading LoRA: {full_path} (r={lora_cfg.r})")
+            model.load_lora(full_path)
+            self._current_lora = full_path
+        model.set_lora_enabled(True)
 
     def prompt_wav_recognition(self, prompt_wav: Optional[str]) -> str:
         if prompt_wav is None:
@@ -280,7 +381,7 @@ class VoxCPMDemo:
         prompt_text: str = "",
         cfg_value_input: float = 2.0,
         do_normalize: bool = True,
-        denoise: bool = True,
+        denoise: bool = False,
         inference_timesteps: int = 10,
     ) -> Tuple[int, np.ndarray]:
         current_model = self.get_or_load_voxcpm()
@@ -290,7 +391,6 @@ class VoxCPMDemo:
             raise ValueError("Please input text to synthesize.")
 
         control = (control_instruction or "").strip()
-        final_text = f"({control}){text}" if control else text
 
         audio_path = reference_wav_path_input if reference_wav_path_input else None
         prompt_text_clean = (prompt_text or "").strip() or None
@@ -302,7 +402,8 @@ class VoxCPMDemo:
         else:
             logger.info(f"[Voice Design] control: {control[:50] if control else 'None'}...")
 
-        logger.info(f"Generating audio for text: '{final_text[:80]}...'")
+        final_text = f"({control}){text}" if control else text
+        logger.info(f"Generating audio: '{final_text[:80]}...'")
         generate_kwargs = self._build_generate_kwargs(
             final_text=final_text,
             audio_path=audio_path,
@@ -315,11 +416,172 @@ class VoxCPMDemo:
         wav = current_model.generate(**generate_kwargs)
         return (current_model.tts_model.sample_rate, wav)
 
+    @staticmethod
+    def _split_sentences(text: str) -> List[str]:
+        """Split text into sentences by Chinese/English punctuation."""
+        # Split on sentence-ending punctuation, keeping the punctuation attached
+        parts = re.split(r'(?<=[。！？；\n.!?;])', text)
+        sentences = [s.strip() for s in parts if s.strip()]
+        if not sentences:
+            sentences = [text]
+        return sentences
+
+    def generate_tts_audio_segmented(
+        self,
+        text_input: str,
+        control_instruction: str = "",
+        reference_wav_path_input: Optional[str] = None,
+        prompt_text: str = "",
+        cfg_value_input: float = 2.0,
+        do_normalize: bool = True,
+        denoise: bool = False,
+        inference_timesteps: int = 10,
+        lookback: bool = False,
+    ) -> Tuple[int, np.ndarray]:
+        """Generate audio sentence-by-sentence to prevent autoregressive quality degradation.
+
+        Args:
+            lookback: If True, merge previous sentence's audio features into
+                prompt_cache for each subsequent sentence (improves prosody
+                continuity at the cost of slight error propagation).
+        """
+        current_model = self.get_or_load_voxcpm()
+
+        text = (text_input or "").strip()
+        if len(text) == 0:
+            raise ValueError("Please input text to synthesize.")
+
+        control = (control_instruction or "").strip()
+        audio_path = reference_wav_path_input if reference_wav_path_input else None
+        prompt_text_clean = (prompt_text or "").strip() or None
+
+        sr = current_model.tts_model.sample_rate
+
+        # Build prompt_cache once (shared across all segments)
+        from voxcpm.model.voxcpm2 import VoxCPM2Model
+        is_v2 = isinstance(current_model.tts_model, VoxCPM2Model)
+
+        # Handle denoising for prompt/reference audio
+        actual_prompt_path = audio_path if (prompt_text_clean and audio_path) else None
+        actual_ref_path = audio_path
+
+        if denoise and current_model.denoiser is not None:
+            import tempfile
+            try:
+                if actual_prompt_path:
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                    current_model.denoiser.enhance(actual_prompt_path, output_path=tmp.name)
+                    actual_prompt_path = tmp.name
+                if actual_ref_path and actual_ref_path != actual_prompt_path:
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                    current_model.denoiser.enhance(actual_ref_path, output_path=tmp.name)
+                    actual_ref_path = tmp.name
+            except Exception as e:
+                logger.warning(f"Denoising failed, skipping: {e}")
+                actual_prompt_path = audio_path if (prompt_text_clean and audio_path) else None
+                actual_ref_path = audio_path
+
+        # Build prompt_cache
+        if actual_prompt_path or actual_ref_path:
+            if is_v2:
+                fixed_prompt_cache = current_model.tts_model.build_prompt_cache(
+                    prompt_text=prompt_text_clean if actual_prompt_path else None,
+                    prompt_wav_path=actual_prompt_path,
+                    reference_wav_path=actual_ref_path if (actual_ref_path and not actual_prompt_path) else (
+                        actual_ref_path if (actual_ref_path and actual_prompt_path) else None
+                    ),
+                )
+            else:
+                fixed_prompt_cache = current_model.tts_model.build_prompt_cache(
+                    prompt_text=prompt_text_clean,
+                    prompt_wav_path=actual_prompt_path,
+                )
+        else:
+            fixed_prompt_cache = None
+
+        # Normalize text if needed
+        if do_normalize:
+            if current_model.text_normalizer is None:
+                from voxcpm.utils.text_normalize import TextNormalizer
+                current_model.text_normalizer = TextNormalizer()
+            # Normalize will be applied per-segment below
+
+        # Prepend control instruction to each sentence
+        sentences = self._split_sentences(text)
+        mode_str = "lookback-1-clean" if lookback else "clear"
+        logger.info(f"Segmented generation ({mode_str}): {len(sentences)} segments")
+
+        from voxcpm.core import next_and_close
+
+        def _gen_one(text_str, cache):
+            """Generate one sentence, return (wav_np, audio_feat)."""
+            gen = current_model.tts_model._generate_with_prompt_cache(
+                target_text=text_str,
+                prompt_cache=cache,
+                inference_timesteps=inference_timesteps,
+                cfg_value=float(cfg_value_input),
+                streaming=False,
+            )
+            wav_t, _, feat = next_and_close(gen)
+            return wav_t.squeeze(0).cpu().numpy(), feat
+
+        wav_segments = []
+        prev_clean_feat = None  # clean feature from previous sentence (generated with original cache)
+
+        for i, sentence in enumerate(sentences):
+            if do_normalize and current_model.text_normalizer is not None:
+                sentence = current_model.text_normalizer.normalize(sentence)
+
+            final_sentence = f"({control}){sentence}" if control else sentence
+            logger.info(f"  [{i+1}/{len(sentences)}] '{final_sentence[:60]}...'")
+
+            if not lookback or not is_v2 or prev_clean_feat is None:
+                # First sentence or no-lookback mode: generate with original cache
+                wav_np, clean_feat = _gen_one(final_sentence, fixed_prompt_cache)
+                wav_segments.append(wav_np)
+                prev_clean_feat = (final_sentence, clean_feat)
+            else:
+                # Lookback mode (sentence 2+):
+                # Pass 1: generate with original cache → clean features (for next sentence)
+                logger.info(f"    Pass 1: clean generation (original cache)")
+                _, clean_feat = _gen_one(final_sentence, fixed_prompt_cache)
+
+                # Pass 2: generate with original cache + prev clean features → output audio
+                lookback_cache = current_model.tts_model.merge_prompt_cache(
+                    fixed_prompt_cache,
+                    new_text=prev_clean_feat[0],
+                    new_audio_feat=prev_clean_feat[1],
+                )
+                logger.info(f"    Pass 2: lookback generation (+ prev clean feat)")
+                wav_np, _ = _gen_one(final_sentence, lookback_cache)
+                wav_segments.append(wav_np)
+                prev_clean_feat = (final_sentence, clean_feat)
+
+        # Concatenate all segments
+        final_wav = np.concatenate(wav_segments)
+        logger.info(f"Segmented generation complete: {len(wav_segments)} segments, {len(final_wav)/sr:.1f}s total")
+        return (sr, final_wav)
+
 
 # ---------- UI ----------
 
 def create_demo_interface(demo: VoxCPMDemo):
     gr.set_static_paths(paths=[Path.cwd().absolute() / "assets"])
+
+    # Lazy-loaded audio super-resolution model
+    _sr_model = None
+
+    def _get_sr_model():
+        nonlocal _sr_model
+        if _sr_model is None:
+            from audio_sr import AudioSuperResolution
+            try:
+                _sr_model = AudioSuperResolution(device="cuda")
+                logger.info("AP-BWE audio super-resolution model loaded")
+            except FileNotFoundError as e:
+                logger.warning(f"AP-BWE model not found: {e}")
+                return None
+        return _sr_model
 
     def _generate(
         text: str,
@@ -331,19 +593,49 @@ def create_demo_interface(demo: VoxCPMDemo):
         do_normalize: bool,
         denoise: bool,
         dit_steps: int,
+        lora_selection: Optional[str] = None,
+        audio_sr_enabled: bool = False,
+        seg_enabled: bool = False,
+        seg_lookback: int = 0,
     ):
+        # LoRA hot-swap before generation
+        demo.swap_lora(lora_selection)
+
         actual_prompt_text = prompt_text_value.strip() if use_prompt_text else ""
         actual_control = "" if use_prompt_text else control_instruction
-        sr, wav_np = demo.generate_tts_audio(
-            text_input=text,
-            control_instruction=actual_control,
-            reference_wav_path_input=ref_wav,
-            prompt_text=actual_prompt_text,
-            cfg_value_input=cfg_value,
-            do_normalize=do_normalize,
-            denoise=denoise,
-            inference_timesteps=int(dit_steps),
-        )
+
+        if seg_enabled:
+            sr, wav_np = demo.generate_tts_audio_segmented(
+                text_input=text,
+                control_instruction=actual_control,
+                reference_wav_path_input=ref_wav,
+                prompt_text=actual_prompt_text,
+                cfg_value_input=cfg_value,
+                do_normalize=do_normalize,
+                denoise=denoise,
+                inference_timesteps=int(dit_steps),
+                lookback=(int(seg_lookback) >= 1),
+            )
+        else:
+            sr, wav_np = demo.generate_tts_audio(
+                text_input=text,
+                control_instruction=actual_control,
+                reference_wav_path_input=ref_wav,
+                prompt_text=actual_prompt_text,
+                cfg_value_input=cfg_value,
+                do_normalize=do_normalize,
+                denoise=denoise,
+                inference_timesteps=int(dit_steps),
+            )
+
+        # Apply audio super-resolution if enabled
+        if audio_sr_enabled:
+            sr_model = _get_sr_model()
+            if sr_model is not None:
+                logger.info("Applying AP-BWE audio super-resolution...")
+                wav_np, sr = sr_model(wav_np, orig_sr=sr)
+                logger.info(f"Super-resolution complete, output sr={sr}")
+
         return (sr, wav_np)
 
     def _on_toggle_instant(checked):
@@ -412,6 +704,16 @@ def create_demo_interface(demo: VoxCPMDemo):
                     lines=3,
                 )
 
+                with gr.Accordion("🧩 LoRA", open=False):
+                    with gr.Row():
+                        lora_select = gr.Dropdown(
+                            choices=["None"] + scan_lora_checkpoints(),
+                            value="None",
+                            label="LoRA Checkpoint",
+                            scale=4,
+                        )
+                        refresh_lora_btn = gr.Button("🔄", scale=1, min_width=60)
+
                 with gr.Accordion(I18N("advanced_settings_title"), open=False):
                     DoDenoisePromptAudio = gr.Checkbox(
                         value=False,
@@ -441,12 +743,37 @@ def create_demo_interface(demo: VoxCPMDemo):
                         label=I18N("dit_steps_label"),
                         info=I18N("dit_steps_info"),
                     )
-
+                    audio_sr_checkbox = gr.Checkbox(
+                        value=False,
+                        label=I18N("audio_sr_label"),
+                        elem_classes=["switch-toggle"],
+                        info=I18N("audio_sr_info"),
+                    )
+                    seg_enabled_checkbox = gr.Checkbox(
+                        value=False,
+                        label=I18N("seg_mode_label"),
+                        elem_classes=["switch-toggle"],
+                        info=I18N("seg_mode_info"),
+                    )
+                    seg_lookback_slider = gr.Slider(
+                        minimum=0,
+                        maximum=1,
+                        value=0,
+                        step=1,
+                        label="回看步数",
+                        info="0 = 每句清除 KV Cache，1 = 回看上一句",
+                    )
                 run_btn = gr.Button(I18N("generate_btn"), variant="primary", size="lg")
 
             with gr.Column():
                 audio_output = gr.Audio(label=I18N("generated_audio_label"))
                 gr.Markdown(I18N("examples_footer"))
+
+        # LoRA refresh
+        refresh_lora_btn.click(
+            fn=lambda: gr.update(choices=["None"] + scan_lora_checkpoints()),
+            outputs=[lora_select],
+        )
 
         show_prompt_text.change(
             fn=_on_toggle_instant,
@@ -470,6 +797,10 @@ def create_demo_interface(demo: VoxCPMDemo):
                 DoNormalizeText,
                 DoDenoisePromptAudio,
                 dit_steps,
+                lora_select,
+                audio_sr_checkbox,
+                seg_enabled_checkbox,
+                seg_lookback_slider,
             ],
             outputs=[audio_output],
             show_progress=True,

@@ -4,3 +4,7 @@ voxcpm.egg-info
 .DS_Store
 ./pretrained_models/
 app_local.py
+models/
+lora/
+lora_train_data/
+ap_bwe_checkpoints/

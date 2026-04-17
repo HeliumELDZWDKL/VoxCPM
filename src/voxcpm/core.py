@@ -247,16 +247,22 @@ class VoxCPM:
             actual_ref_path = reference_wav_path
 
             if denoise and self.denoiser is not None:
-                if prompt_wav_path is not None:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                        temp_files.append(tmp.name)
-                    self.denoiser.enhance(prompt_wav_path, output_path=temp_files[-1])
-                    actual_prompt_path = temp_files[-1]
-                if reference_wav_path is not None:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                        temp_files.append(tmp.name)
-                    self.denoiser.enhance(reference_wav_path, output_path=temp_files[-1])
-                    actual_ref_path = temp_files[-1]
+                try:
+                    if prompt_wav_path is not None:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                            temp_files.append(tmp.name)
+                        self.denoiser.enhance(prompt_wav_path, output_path=temp_files[-1])
+                        actual_prompt_path = temp_files[-1]
+                    if reference_wav_path is not None:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                            temp_files.append(tmp.name)
+                        self.denoiser.enhance(reference_wav_path, output_path=temp_files[-1])
+                        actual_ref_path = temp_files[-1]
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).warning(f"Denoising failed, skipping: {e}")
+                    actual_prompt_path = prompt_wav_path
+                    actual_ref_path = reference_wav_path
 
             if actual_prompt_path is not None or actual_ref_path is not None:
                 if is_v2:
