@@ -1,146 +1,132 @@
-# 📊 VoxCPM2 与官方仓库同步状态
+# VoxCPM2 与官方仓库同步状态
 
-> **本文件用途**：追踪本地仓库相对于上游 [OpenBMB/VoxCPM](https://github.com/OpenBMB/VoxCPM) 的同步进度、差异点与合并历史。
-> **相关文档**：
-> - 本地自定义改动清单 → [`CUSTOM_CHANGES.md`](./CUSTOM_CHANGES.md)
-> - 升级前结构化备份 → [`backup_before_upgrade_20260429_154548/README.md`](./backup_before_upgrade_20260429_154548/README.md)
+> 本文件用于记录本地仓库相对上游 [OpenBMB/VoxCPM](https://github.com/OpenBMB/VoxCPM) 的同步进度、差异点与下一步操作。
+>
+> 相关文档：
+> - 本地自定义改动清单：[CUSTOM_CHANGES.md](./CUSTOM_CHANGES.md)
+> - 升级前结构化备份：[backup_before_upgrade_20260429_154548/README.md](./backup_before_upgrade_20260429_154548/README.md)
 
 ---
 
-## 🕒 最近一次扫描
+## 最近一次扫描
 
 | 项 | 值 |
 |---|---|
-| 扫描时间 | 2026-05-06 |
+| 扫描时间 | 2026-05-13 |
 | 官方仓库 | https://github.com/OpenBMB/VoxCPM |
-| 官方 main HEAD | `19b6bf7` — *fix: handle LoRA rank mismatch during inference in lora_ft_webui* （2026-04-28） |
-| 官方最新 Tag | `v2.0.2` — `68af4fe`（2026-04-08） |
-| **本地进度** | **已追平 main HEAD（`19b6bf7`）** |
-| **待拉取 commit** | **0 条** ✅ |
+| 官方 main HEAD | `19b6bf7` - `fix: handle LoRA rank mismatch during inference in lora_ft_webui`，2026-04-28 |
+| 官方最新 Tag | `2.0.3` - `19b6bf7` |
+| 本地当前分支 | `local-custom` |
+| 本地当前 HEAD | `c11c87c` - `Keep local artifacts out of git and save VoxCPM updates` |
+| 官方自上次记录后的新增 commit | `0` |
+| 当前结论 | 官方 `main` 暂无新提交；仅最新 tag 从 `2.0.2` 更新为 `2.0.3` |
 
 ---
 
-## 📈 本地文件行数基线（验证依据）
+## Git 对比结果
 
-| 文件 | 备份时本地（2026-04-29 前） | 备份时官方 | **当前本地** | 状态 |
-|---|---|---|---|---|
-| `src/voxcpm/model/voxcpm.py` | 993 | 1008 | **1006** | ✅ 已合并 |
-| `src/voxcpm/model/voxcpm2.py` | 1244 | 1259 | **1257** | ✅ 已合并 |
-| `src/voxcpm/cli.py` | 607 | 更多 | **653** | ✅ 已合并（新增 `cmd_validate`） |
-| `src/voxcpm/training/validate.py` | ❌ 缺失 | 新增 | **310 行存在** | ✅ 已合并 |
-| `tests/test_validate.py` | — | — | **252 行存在** | ✅ 已合并 |
-| `lora_ft_webui.py` | 1635 | ~1700 | **1540** | ✅ 已合并（含 LoRA rank mismatch 修复） |
-| `app.py` | 840 | ~500 | **513** | ✅ 已大幅对齐官方 |
-| `scripts/train_voxcpm_finetune.py` | 844 | 844 | **840** | ✅ 基本一致 |
+本次执行：
 
-### 关键代码特征核对
-- ✅ `lora_ft_webui.py` 含 `"LoRA rank mismatch (model r=..., checkpoint r=..., reloading...)"` → 合入 `19b6bf7` (2026-04-28)
-- ✅ `cli.py` 266/309 行 `import soundfile as sf` 在函数体内 → 合入 `dd7b78f` (2026-04-24 defer imports)
-- ✅ `cli.py` 290 行 `def cmd_validate(...)` → 合入 `4457617` (2026-04-12 validate CLI)
-- ✅ `voxcpm2.py` 1082 行 "Yield only the newest patch latent for stateful VAE decode" → 合入 `3589598` (2026-04-15 stateful streaming VAE)
-- ✅ `training/__init__.py` 导出 `validate_manifest, ValidationResult`
+```powershell
+git fetch upstream --prune
+git log --oneline --decorate -n 8 upstream/main
+git log --oneline --date=short --pretty=format:"%h %ad %s" 19b6bf7..upstream/main
+git rev-list --left-right --count HEAD...upstream/main
+```
 
----
+结果说明：
 
-## 🔄 已合并的上游 commit（自 v2.0.2 以来 32 条）
-
-### 🔧 代码修复与优化（18 条）
-| SHA | 日期 | 说明 |
-|---|---|---|
-| `5611bd0` | 2026-04-08 | optim app.py |
-| `6620513` | 2026-04-08 | perf: stateful streaming VAE decode — eliminate redundant overlap |
-| `75cfa3e` | 2026-04-09 | fix: uncompiled feat_encoder for prefill（CUDA Graph 动态 shape 累积） |
-| `4f4a5b9` | 2026-04-09 | fix: _generate() 类型检查顺序（非字符串输入 AttributeError） |
-| `e4e0496` | 2026-04-11 | update finetuning pipeline and runtime device handling |
-| `fb46aad` | 2026-04-11 | fix: close file handles in from_local() config loading |
-| `b1584ae` | 2026-04-13 | fix: stabilize CPU SDPA mask broadcasting |
-| `61b36d4` | 2026-04-13 | refactor: centralize generator cleanup in model helpers |
-| `1565e83` | 2026-04-13 | fix: complete shared generator cleanup coverage |
-| `38d61cd` | 2026-04-15 | fix(mps): force float32 on Apple Silicon |
-| `f7f1b78` | 2026-04-15 | fix: correct transpose conv context |
-| `3589598` | 2026-04-15 | Merge PR #212: stateful streaming VAE decode |
-| `ec2acec` | 2026-04-17 | Harden LoRA checkpoint loading against untrusted pickle |
-| `d3cc887` | 2026-04-21 | feat: enhance control text processing in VoxCPMDemo |
-| `96d605b` | 2026-04-21 | fix(mps): align VOXCPM_MPS_DTYPE override set |
-| `4509bec` | 2026-04-21 | fix: address four validation correctness issues |
-| `dd7b78f` | 2026-04-24 | refactor(cli): defer soundfile/voxcpm.core imports |
-| `19b6bf7` | **2026-04-28** | ⭐ fix: handle LoRA rank mismatch during inference in lora_ft_webui |
-
-### ✨ 新功能（1 条）
-| SHA | 日期 | 说明 |
-|---|---|---|
-| `4457617` | 2026-04-12 | feat: add `voxcpm validate` CLI for pre-flight training data checks（新增 `src/voxcpm/training/validate.py`） |
-
-### 🧪 测试（1 条）
-| SHA | 日期 | 说明 |
-|---|---|---|
-| `29577d5` | 2026-04-24 | test: fix test_cli_validate_exit_code |
-
-### 🧹 杂项（1 条）
-| SHA | 日期 | 说明 |
-|---|---|---|
-| `79c0cf6` | 2026-04-09 | chore: remove accidentally committed app_local.py |
-
-### 📖 文档（4 条）
-| SHA | 日期 | 说明 |
-|---|---|---|
-| `364eff6` | 2026-04-08 | update readme: python version |
-| `6d10932` | 2026-04-08 | update readme |
-| `eae0a29` | 2026-04-16 | docs: add ComfyUI RH link |
-| `afa63e6` | 2026-04-17 | docs: add vLLM-Omni serving references |
-
-### 🔀 Merge 节点（7 条，本身不带代码改动）
-`abf01b9`、`5510503`、`13605c5`、`77f847f`、`a9b03a7`、`cd79a64`、`86bff0f`
+- `upstream/main` 仍指向 `19b6bf7`。
+- `19b6bf7..upstream/main` 没有输出，说明官方没有比上次记录更新的 commit。
+- `git rev-list --left-right --count HEAD...upstream/main` 输出 `3 13`：
+  - 左侧 `3` 是本地 `local-custom` 独有提交。
+  - 右侧 `13` 是官方历史中未作为 Git merge 祖先进入本地分支的提交。
+  - 注意：这些官方变更已经按文件内容人工对齐过一批，所以这里不能简单理解为“还有 13 个功能没合入”；它主要反映当前分支没有做完整的 upstream merge。
 
 ---
 
-## 🎨 本地相对官方的**持久性差异**
+## 当前本地独有提交
 
-下列是本地刻意保留、**不会被官方覆盖**的定制点：
-
-### 本地独有文件（官方没有）
-- `audio_sr.py` — AP-BWE 音频超分辨率模块
-- `batch_generate_emotions.py` — 批量情感语音生成
-- `batch_voice_design.py` — 批量声音设计
-- `check_env.py` — 环境检查
-- `app_old.py` — 旧版 WebUI 备份
-- `启动VoxCPM2.bat` / `启动LoRA_WebUI.bat` — Windows 一键启动脚本
-- `lora_paper_zh.md` — LoRA 论文中文翻译
-- `CUSTOM_CHANGES.md` / `UPSTREAM_SYNC_STATUS.md` — 文档
-- `reference_audios/` / `lora_train_data/` — 本地数据
-- `ap_bwe_checkpoints/` — 超分模型检查点
-
-### 已二次定制的文件（深度改动）
-- `lora_ft_webui.py`（1540 行）— 三种推理模式、分段生成、CSS 动画、进度条
-- `app.py`（513 行）— LoRA 热加载/热交换、超分开关、降噪开关、dit_steps 滑块
-  - 注：2026-04-16 已撤销"分段生成"逻辑，恢复整段一次性生成（详见 `CUSTOM_CHANGES.md`）
-
-### 环境侧约定
-- `torchcodec` 已卸载（参考音频降噪时会因缺失 FFmpeg DLL 崩溃）
-- CUDA 推理使用 bfloat16
-- 48kHz 下默认禁用 Denoiser/Enhance Audio（zipenhancer 会损伤高频）
+| SHA | 日期 | 说明 |
+|---|---|---|
+| `c11c87c` | 2026-05-13 | 忽略本地模型/训练产物，并提交 VoxCPM 本地更新 |
+| `7c0d686` | 2026-04-17 | 在 `CUSTOM_CHANGES.md` 增加部署说明 |
+| `35934e9` | 2026-04-17 | 增加本地自定义功能、音频超分、批量生成、LoRA WebUI 与参考音频 |
 
 ---
 
-## 🧭 下次同步操作清单
+## 已确认对齐的官方基线
 
-当上游 main 再更新时，建议按以下步骤：
+上次对齐目标仍有效：
 
-1. **先扫描**：访问 https://github.com/OpenBMB/VoxCPM/commits/main 看 `19b6bf7` 之后是否有新提交
-2. **做备份**：按 `backup_before_upgrade_YYYYMMDD_HHMMSS/` 结构化备份当前本地状态
-3. **逐条评估**：对每条新 commit 标注冲突等级
-   - 🟢 零风险（只动训练脚本、文档、非冲突文件） → 直接合入
-   - 🟡 需合并（动 `voxcpm.py` / `voxcpm2.py` / `cli.py`） → 人工 cherry-pick，保留本地 +15 行类改动
-   - 🔴 高冲突（动 `app.py` / `lora_ft_webui.py`） → 只手动 cherry-pick 具体 bug 修复，**绝不整体覆盖**
-4. **回归验证**：启动 `app.py` 和 `lora_ft_webui.py`，确认 LoRA 热加载、超分、降噪、VAE 流式解码均正常
-5. **更新本文件**：追加新一次的扫描结果与合并清单
+| 官方 commit | 日期 | 说明 |
+|---|---|---|
+| `19b6bf7` | 2026-04-28 | 修复 `lora_ft_webui.py` 推理时 LoRA rank mismatch 处理 |
+
+该 commit 现在同时是官方 `main` 和最新 tag `2.0.3`。
 
 ---
 
-## 📜 变更历史
+## 本地持久差异
+
+这些是本地刻意保留、不要被官方覆盖的改动：
+
+- `lora_ft_webui.py`：本地 LoRA WebUI、分段生成、进度显示、checkpoint 加载等定制逻辑。
+- `app.py`：本地 WebUI 调整、LoRA 热加载/切换、超分与降噪相关开关。
+- `audio_sr.py`：AP-BWE 音频超分模块。
+- `batch_generate_emotions.py` / `batch_voice_design.py`：批量生成与声音设计脚本。
+- `check_env.py`：环境检查脚本。
+- `启动VoxCPM2.bat` / `启动LoRA_WebUI.bat`：Windows 启动脚本。
+- `CUSTOM_CHANGES.md` / `UPSTREAM_SYNC_STATUS.md`：本地维护文档。
+- `reference_audios/` 与 `reference_audios.zip`：本地参考音频资源。
+
+以下内容属于本地运行产物，已在 `.gitignore` 中排除，不应上传 Git：
+
+- `models/`
+- `lora/`
+- `lora_train_data/`
+- `ap_bwe_checkpoints/`
+- `backup_before_upgrade_*/`
+- `VoxCPM_*.pdf`
+- `*.safetensors` / `*.pth` / `*.pt` / `*.ckpt`
+- `runs/` / `wandb/` / `*.tfevents.*`
+
+---
+
+## 下一次同步步骤
+
+当官方 `main` 再次更新时，建议按以下流程处理：
+
+1. 扫描官方新增提交：
+
+   ```powershell
+   git fetch upstream --prune
+   git log --oneline --date=short 19b6bf7..upstream/main
+   ```
+
+2. 逐条评估新增 commit 的风险：
+
+   - 低风险：文档、测试、非冲突脚本，可以直接合入或 cherry-pick。
+   - 中风险：`src/voxcpm/model/*`、`src/voxcpm/cli.py`、`src/voxcpm/training/*`，需要检查本地改动后合入。
+   - 高风险：`app.py`、`lora_ft_webui.py`，只抽取明确 bug fix，避免整体覆盖本地定制。
+
+3. 合入后验证：
+
+   ```powershell
+   python -m compileall app.py lora_ft_webui.py scripts src tests
+   python -m pytest tests/test_validate.py tests/test_lora_checkpoint_loading.py scripts/test_pick_runtime_dtype.py
+   ```
+
+   当前机器的全局 Python 环境缺少 `pytest`，如需跑完整测试，需要先安装项目 `dev` 依赖或使用带 pytest 的虚拟环境。
+
+4. 更新本文档的扫描时间、官方 HEAD、最新 tag、待合入 commit 清单与验证结果。
+
+---
+
+## 变更历史
 
 | 日期 | 事件 |
 |---|---|
-| 2026-04-29 | 升级前结构化备份（`backup_before_upgrade_20260429_154548/`），基线为 `86bff0f` 之前 |
-| 2026-04-29 ~ 2026-05-06 间 | 完成一次完整拉取合并，追平到 `19b6bf7`（2026-04-28） |
-| 2026-05-06 | 创建本文件，记录同步状态 |
+| 2026-04-29 | 升级前结构化备份，基线为 `86bff0f` 附近 |
+| 2026-05-06 | 完成一次完整拉取评估，追平到官方 `19b6bf7` |
+| 2026-05-13 | 重新扫描官方仓库：无新增 commit；最新 tag 更新为 `2.0.3`；重写本文档为可读中文 |
