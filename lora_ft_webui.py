@@ -14,16 +14,10 @@ from typing import Optional
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root / "src"))
 
-# Default pretrained model path: use relative paths for compatibility with from_pretrained
-# (absolute paths cause "Repo id must use alphanumeric chars" errors)
-_v2_rel = "models/VoxCPM2"
-_v2_hf_rel = "models/openbmb__VoxCPM2"
-_v15_rel = "models/openbmb__VoxCPM1.5"
-default_pretrained_path = (
-    _v2_rel if (project_root / _v2_rel).exists()
-    else _v2_hf_rel if (project_root / _v2_hf_rel).exists()
-    else _v15_rel
-)
+# Default pretrained model path: prefer VoxCPM2 if it exists, fallback to VoxCPM1.5
+_v2_path = project_root / "models" / "openbmb__VoxCPM2"
+_v15_path = project_root / "models" / "openbmb__VoxCPM1.5"
+default_pretrained_path = str(_v2_path if _v2_path.exists() else _v15_path)
 
 from voxcpm.core import VoxCPM
 from voxcpm.model.voxcpm import LoRAConfig
@@ -55,7 +49,7 @@ LANG_DICT = {
         "select_lora": "Select LoRA Checkpoint",
         "cfg_scale": "CFG Scale",
         "infer_steps": "Inference Steps",
-
+        "seed": "Seed",
         "gen_audio": "Generate Audio",
         "gen_output": "Generated Audio",
         "status": "Status",
@@ -86,7 +80,7 @@ LANG_DICT = {
         "select_lora": "选择 LoRA 模型",
         "cfg_scale": "CFG Scale (引导系数)",
         "infer_steps": "推理步数",
-
+        "seed": "随机种子 (Seed)",
         "gen_audio": "生成音频",
         "gen_output": "生成结果",
         "status": "状态",
@@ -258,8 +252,49 @@ def load_model(pretrained_path, lora_path=None):
     return "Model loaded successfully!"
 
 
-def run_inference(text, prompt_wav, prompt_text, lora_selection, cfg_scale, steps, pretrained_path=None):
-    global current_model
+def _split_sentences(text: str):
+    """按中英文句末标点切分长文本为句子列表（保留标点）。
+    切分符：。！？；.!?;? 以及换行。相邻短句会尽量保留；空段丢弃。
+    """
+    import re
+    if not text:
+        return []
+    # 用捕获组保留分隔符，分隔符与前句合并
+    parts = re.split(r"([。！？；.!?;\n]+)", text)
+    out = []
+    buf = ""
+    for p in parts:
+        if not p:
+            continue
+        buf += p
+        if re.search(r"[。！？；.!?;\n]$", p):
+            s = buf.strip()
+            if s:
+                out.append(s)
+            buf = ""
+    tail = buf.strip()
+    if tail:
+        out.append(tail)
+    return out if out else [text]
+
+
+def run_inference(text, prompt_wav, prompt_text, use_prompt_text, control_instruction,
+                  lora_selection, cfg_scale, steps, seed,
+                  normalize, retry_badcase, seg_enabled, seg_lookback,
+                  pretrained_path=None):
+    """Generate audio with LoRA support.
+
+    三种推理模式（与主 WebUI 对齐）：
+      - 极致克隆：参考音频 + 参考文本（勾选 use_prompt_text）→ prompt_wav_path + prompt_text
+      - 可控克隆：仅参考音频（不勾选）→ reference_wav_path（仅 V2 模型支持）
+      - 风格设计：无参考音频 + control_instruction 前缀
+
+    长文本处理（方案 A + C + D，全部假设 V2 基座）：
+      - normalize: 文本规范化开关（官方默认 False）
+      - retry_badcase: badcase 重试开关（官方默认 True）
+      - seg_enabled: 是否按句子分段生成，避免长文本后半段漂移
+      - seg_lookback: 分段时回看前 N 句干净特征（0~5），0 = 仅切分不回看
+    """
     # 如果选择了 LoRA 模型且当前模型未加载，尝试从 LoRA config 读取 base_model
     if current_model is None:
         # 优先使用用户指定的预训练模型路径
@@ -287,96 +322,220 @@ def run_inference(text, prompt_wav, prompt_text, lora_selection, cfg_scale, step
                 except Exception as e:
                     print(f"Warning: Failed to read base_model from LoRA config: {e}", file=sys.stderr)
 
-        # 加载模型（带上 LoRA 路径，以便从 lora_config.json 读取正确的 r/alpha 等参数）
-        lora_to_load = lora_selection if (lora_selection and lora_selection != "None") else None
+        # 加载模型
+        lora_to_load = lora_selection if lora_selection and lora_selection != "None" else None
         try:
             print(f"Loading base model: {base_model_path}", file=sys.stderr)
-            load_model(base_model_path, lora_path=lora_to_load)
+            load_model(base_model_path, lora_to_load)
             if lora_to_load:
-                print(f"Model loaded with LoRA config from: {lora_to_load}", file=sys.stderr)
+                print(f"Model loaded with LoRA: {lora_selection}", file=sys.stderr)
         except Exception as e:
             error_msg = f"Failed to load model from {base_model_path}: {str(e)}"
             print(error_msg, file=sys.stderr)
             return None, error_msg
+        lora_just_loaded = lora_to_load
+    else:
+        lora_just_loaded = None
 
-    # Handle LoRA hot-swapping (with automatic rank mismatch detection)
+    # Handle LoRA hot-swapping
     assert current_model is not None, "Model must be loaded before inference"
     if lora_selection and lora_selection != "None":
         full_lora_path = os.path.join("lora", lora_selection)
-        print(f"Hot-loading LoRA: {full_lora_path}", file=sys.stderr)
-        try:
-            # Check if LoRA rank matches current model
-            new_lora_cfg, _ = load_lora_config_from_checkpoint(full_lora_path)
-            current_rank = getattr(current_model.tts_model, 'lora_config', None)
-            current_r = current_rank.r if current_rank else None
-            new_r = new_lora_cfg.r if new_lora_cfg else None
 
-            if new_r and current_r != new_r:
-                print(f"LoRA rank mismatch: model has r={current_r}, LoRA needs r={new_r}. Reloading model...", file=sys.stderr)
-                base_path = pretrained_path if pretrained_path and pretrained_path.strip() else default_pretrained_path
-                # Try to read base_model from LoRA config
-                lora_config_file = os.path.join(full_lora_path, "lora_config.json")
-                if os.path.exists(lora_config_file):
-                    try:
-                        with open(lora_config_file, "r", encoding="utf-8") as f:
-                            lora_info = json.load(f)
-                        saved_base = lora_info.get("base_model")
-                        if saved_base and os.path.exists(saved_base):
-                            base_path = saved_base
-                    except Exception:
-                        pass
-                current_model = None
-                import torch; torch.cuda.empty_cache()
-                load_model(base_path, lora_path=lora_selection)
-                print(f"Model reloaded with r={new_r}", file=sys.stderr)
+        if lora_just_loaded != lora_selection:
+            new_lora_config, new_base_model = load_lora_config_from_checkpoint(full_lora_path)
+            current_r = current_model.tts_model.lora_config.r if current_model.tts_model.lora_config else None
+            new_r = new_lora_config.r if new_lora_config else None
+
+            if new_r is not None and current_r is not None and new_r != current_r:
+                print(f"LoRA rank mismatch (model r={current_r}, checkpoint r={new_r}), reloading...", file=sys.stderr)
+                reload_base = (
+                    new_base_model if new_base_model and os.path.exists(new_base_model)
+                    else (pretrained_path if pretrained_path and pretrained_path.strip() else default_pretrained_path)
+                )
+                try:
+                    load_model(reload_base, lora_selection)
+                except Exception as e:
+                    return None, f"Failed to reload model for LoRA rank change: {e}"
             else:
-                current_model.load_lora(full_lora_path)
-                current_model.set_lora_enabled(True)
-        except Exception as e:
-            print(f"Error loading LoRA: {e}", file=sys.stderr)
-            return None, f"Error loading LoRA: {e}"
+                print(f"Hot-loading LoRA: {full_lora_path}", file=sys.stderr)
+                try:
+                    current_model.load_lora(full_lora_path)
+                except Exception as e:
+                    print(f"Error loading LoRA: {e}", file=sys.stderr)
+                    return None, f"Error loading LoRA: {e}"
+        current_model.set_lora_enabled(True)
     else:
         print("Disabling LoRA", file=sys.stderr)
         current_model.set_lora_enabled(False)
 
-    # 处理 prompt 参数：必须同时为 None 或同时有值
-    final_prompt_wav = None
-    final_prompt_text = None
+    # === 随机种子处理：无论用户是否指定，都计算一个 effective_seed 并显式设定 ===
+    import random as _random
+    if seed is None or int(seed) == -1:
+        effective_seed = _random.randint(0, 2**31 - 1)
+    else:
+        effective_seed = int(seed)
+    torch.manual_seed(effective_seed)
+    np.random.seed(effective_seed)
 
-    if prompt_wav and prompt_wav.strip():
-        # 有参考音频
-        final_prompt_wav = prompt_wav
+    # === 三种模式参数解析 ===
+    audio_path = prompt_wav if (prompt_wav and prompt_wav.strip()) else None
+    # use_prompt_text 决定是否启用 prompt_text 分支（极致克隆）
+    prompt_text_clean = (prompt_text or "").strip() if use_prompt_text else None
+    prompt_text_clean = prompt_text_clean if prompt_text_clean else None
+    # control_instruction 仅在非极致克隆模式下生效（可控克隆 / 风格设计）
+    control = (control_instruction or "").strip() if not use_prompt_text else ""
 
-        # 如果没有提供参考文本，尝试自动识别
-        if not prompt_text or not prompt_text.strip():
-            print("参考音频已提供但缺少文本，自动识别中...", file=sys.stderr)
-            try:
-                final_prompt_text = recognize_audio(prompt_wav)
-                if final_prompt_text:
-                    print(f"自动识别文本: {final_prompt_text}", file=sys.stderr)
-                else:
-                    return None, "错误：无法识别参考音频内容，请手动填写参考文本"
-            except Exception as e:
-                return None, f"错误：自动识别参考音频失败 - {str(e)}"
-        else:
-            final_prompt_text = prompt_text.strip()
-    # 如果没有参考音频，两个都设为 None（用于零样本 TTS）
+    # 若勾选极致克隆但缺失参考文本，尝试 ASR 自动识别
+    if use_prompt_text and audio_path and not prompt_text_clean:
+        print("参考音频已提供但缺少文本，自动识别中...", file=sys.stderr)
+        try:
+            prompt_text_clean = recognize_audio(audio_path)
+            if prompt_text_clean:
+                print(f"自动识别文本: {prompt_text_clean}", file=sys.stderr)
+            else:
+                return None, "错误：无法识别参考音频内容，请手动填写参考文本"
+        except Exception as e:
+            return None, f"错误：自动识别参考音频失败 - {str(e)}"
+
+    # 判定模式
+    if audio_path and prompt_text_clean:
+        mode = "极致克隆 (prompt_wav + prompt_text)"
+    elif audio_path:
+        mode = "可控克隆 (reference_wav only)"
+    else:
+        mode = f"风格设计 (control: {control[:40] if control else 'zero-shot'})"
+    print(f"[Inference] Mode: {mode}", file=sys.stderr)
+
+    # 构建最终文本（control_instruction 作为前缀）
+    final_text = f"({control}){text}" if control else text
+
+    # 按模式选择正确的官方 API 参数通道：
+    #   极致克隆：prompt_wav_path + prompt_text（成对，续写式克隆）
+    #   可控克隆：reference_wav_path（仅 V2，音色隔离通道）
+    #   风格设计：两者都不传
+    gen_kwargs = dict(
+        text=final_text,
+        cfg_value=cfg_scale,
+        inference_timesteps=steps,
+        denoise=False,
+        normalize=bool(normalize),
+        retry_badcase=bool(retry_badcase),
+    )
+    if audio_path and prompt_text_clean:
+        gen_kwargs["prompt_wav_path"] = audio_path
+        gen_kwargs["prompt_text"] = prompt_text_clean
+    elif audio_path:
+        # 可控克隆仅 V2 模型支持（无兜底，让官方报错冒出来足够明确）
+        gen_kwargs["reference_wav_path"] = audio_path
 
     try:
-        audio_np = current_model.generate(
-            text=text,
-            prompt_wav_path=final_prompt_wav,
-            prompt_text=final_prompt_text,
-            cfg_value=cfg_scale,
-            inference_timesteps=steps,
-            denoise=False,
-        )
-        return (current_model.tts_model.sample_rate, audio_np), "Generation Success"
+        # ================= 分段生成路径 =================
+        if seg_enabled:
+            from voxcpm.core import next_and_close
+
+            sr = current_model.tts_model.sample_rate
+            tts = current_model.tts_model
+
+            # 1) 一次性构建 prompt_cache（按当前模式对应的通道）
+            if audio_path and prompt_text_clean:
+                fixed_cache = tts.build_prompt_cache(
+                    prompt_text=prompt_text_clean,
+                    prompt_wav_path=audio_path,
+                )
+            elif audio_path:
+                # 可控克隆 → reference_wav_path
+                fixed_cache = tts.build_prompt_cache(
+                    prompt_text=None,
+                    prompt_wav_path=None,
+                    reference_wav_path=audio_path,
+                )
+            else:
+                fixed_cache = None  # 零样本风格设计
+
+            # 2) 切句 + 可选 text_normalize
+            raw_sentences = _split_sentences(text)
+            sentences = []
+            for s in raw_sentences:
+                if normalize and hasattr(current_model, "text_normalizer") and current_model.text_normalizer:
+                    try:
+                        s = current_model.text_normalizer.normalize(s)
+                    except Exception:
+                        pass
+                if s and s.strip():
+                    sentences.append(s.strip())
+            if not sentences:
+                return None, "分段失败：文本切分后为空"
+
+            N = max(0, min(5, int(seg_lookback)))
+            print(
+                f"[Seg] 分段生成启动 | {len(sentences)} 段 | lookback={N} | control={'有' if control else '空'}",
+                file=sys.stderr,
+            )
+
+            def _gen_one(text_str, cache):
+                gen = tts._generate_with_prompt_cache(
+                    target_text=text_str,
+                    prompt_cache=cache if cache is not None else tts.build_prompt_cache(
+                        prompt_text=None, prompt_wav_path=None
+                    ),
+                    inference_timesteps=int(steps),
+                    cfg_value=float(cfg_scale),
+                    streaming=False,
+                )
+                wav_t, _, feat = next_and_close(gen)
+                return wav_t.squeeze(0).cpu().numpy(), feat
+
+            wav_segments = []
+            prev_feats = []  # 队列：最近 N 句的 (带 control 的文本, clean_feat)
+
+            for i, s in enumerate(sentences):
+                final_s = f"({control}){s}" if control else s
+                print(f"  [{i+1}/{len(sentences)}] {final_s[:60]}", file=sys.stderr)
+
+                first_or_no_lookback = (i == 0) or (N == 0) or (not prev_feats)
+
+                if first_or_no_lookback:
+                    # 首句 / 禁用回看：直接用原 cache
+                    wav_np, clean_feat = _gen_one(final_s, fixed_cache)
+                elif not control:
+                    # control 为空 → Pass 1 与 Pass 2 文本相同 → 单 Pass 退化
+                    lookback_cache = fixed_cache
+                    for prev_text, prev_feat in prev_feats[-N:]:
+                        lookback_cache = tts.merge_prompt_cache(
+                            lookback_cache, new_text=prev_text, new_audio_feat=prev_feat
+                        )
+                    wav_np, clean_feat = _gen_one(s, lookback_cache)
+                else:
+                    # 双 Pass（control 非空）
+                    # Pass 1：带 control 在原 cache 上生成 → 仅取 clean_feat
+                    _, clean_feat = _gen_one(final_s, fixed_cache)
+                    # Pass 2：lookback cache + 纯句子 → 避免念 control
+                    lookback_cache = fixed_cache
+                    for prev_text, prev_feat in prev_feats[-N:]:
+                        lookback_cache = tts.merge_prompt_cache(
+                            lookback_cache, new_text=prev_text, new_audio_feat=prev_feat
+                        )
+                    wav_np, _ = _gen_one(s, lookback_cache)
+
+                wav_segments.append(wav_np)
+                if N > 0:
+                    prev_feats.append((final_s, clean_feat))
+                    if len(prev_feats) > N:
+                        prev_feats.pop(0)
+
+            final_wav = np.concatenate(wav_segments) if len(wav_segments) > 1 else wav_segments[0]
+            dur = len(final_wav) / sr
+            return (sr, final_wav), f"分段生成成功 | {len(sentences)} 段 / {dur:.1f}s | lookback={N} | Seed: {effective_seed} | 模式: {mode}"
+
+        # ================= 常规路径 =================
+        audio_np = current_model.generate(**gen_kwargs)
+        return (current_model.tts_model.sample_rate, audio_np), f"生成成功 | Seed: {effective_seed} | 模式: {mode}"
     except Exception as e:
         import traceback
 
         traceback.print_exc()
-        return None, f"Error: {str(e)}"
+        return None, f"Error (Seed: {effective_seed}): {str(e)}"
 
 
 def start_training(
@@ -909,65 +1068,65 @@ with gr.Blocks(title="VoxCPM LoRA WebUI", theme=gr.themes.Soft(), css=custom_css
     with gr.Row(elem_classes="title-section"):
         with gr.Column(scale=3):
             title_md = gr.Markdown("""
-            # 🎵 VoxCPM LoRA WebUI
+            # VoxCPM LoRA WebUI
             ### 强大的语音合成和 LoRA 微调工具
 
             支持语音克隆、LoRA 模型训练和推理的完整解决方案
             """)
         with gr.Column(scale=1):
             lang_btn = gr.Radio(
-                choices=["en", "zh"], value="zh", label="🌐 Language / 语言", elem_classes="lang-selector"
+                choices=["en", "zh"], value="zh", label="Language / 语言", elem_classes="lang-selector"
             )
 
     with gr.Tabs(elem_classes="tabs") as tabs:
         # === Training Tab ===
-        with gr.Tab("🚀 训练 (Training)") as tab_train:
+        with gr.Tab("训练 (Training)") as tab_train:
             gr.Markdown("""
-            ### 🎯 模型训练设置
+            ### 模型训练设置
             配置你的 LoRA 微调训练参数
             """)
 
             with gr.Row():
                 with gr.Column(scale=2, elem_classes="form-section"):
-                    gr.Markdown("#### 📁 基础配置")
+                    gr.Markdown("#### 基础配置")
 
                     train_pretrained_path = gr.Textbox(
-                        label="📂 预训练模型路径", value=default_pretrained_path, elem_classes="input-field"
+                        label="预训练模型路径", value=default_pretrained_path, elem_classes="input-field"
                     )
                     train_manifest = gr.Textbox(
-                        label="📋 训练数据清单 (jsonl)",
+                        label="训练数据清单 (jsonl)",
                         value="examples/train_data_example.jsonl",
                         elem_classes="input-field",
                     )
-                    val_manifest = gr.Textbox(label="📊 验证数据清单 (可选)", value="", elem_classes="input-field")
+                    val_manifest = gr.Textbox(label="验证数据清单 (可选)", value="", elem_classes="input-field")
 
-                    gr.Markdown("#### ⚙️ 训练参数")
+                    gr.Markdown("#### 训练参数")
 
                     with gr.Row():
-                        lr = gr.Number(label="📈 学习率 (Learning Rate)", value=1e-4, elem_classes="input-field")
+                        lr = gr.Number(label="学习率 (Learning Rate)", value=1e-4, elem_classes="input-field")
                         num_iters = gr.Number(
-                            label="🔄 最大迭代次数", value=2000, precision=0, elem_classes="input-field"
+                            label="最大迭代次数", value=2000, precision=0, elem_classes="input-field"
                         )
                         batch_size = gr.Number(
-                            label="📦 批次大小 (Batch Size)", value=1, precision=0, elem_classes="input-field"
+                            label="批次大小 (Batch Size)", value=1, precision=0, elem_classes="input-field"
                         )
 
                     with gr.Row():
-                        lora_rank = gr.Number(label="🎯 LoRA Rank", value=32, precision=0, elem_classes="input-field")
-                        lora_alpha = gr.Number(label="⚖️ LoRA Alpha", value=16, precision=0, elem_classes="input-field")
+                        lora_rank = gr.Number(label="LoRA Rank", value=32, precision=0, elem_classes="input-field")
+                        lora_alpha = gr.Number(label="LoRA Alpha", value=16, precision=0, elem_classes="input-field")
                         save_interval = gr.Number(
-                            label="💾 保存间隔 (Steps)", value=1000, precision=0, elem_classes="input-field"
+                            label="保存间隔 (Steps)", value=1000, precision=0, elem_classes="input-field"
                         )
 
                     output_name = gr.Textbox(
-                        label="📁 输出目录名称 (可选，若存在则继续训练)", value="", elem_classes="input-field"
+                        label="输出目录名称 (可选，若存在则继续训练)", value="", elem_classes="input-field"
                     )
 
                     with gr.Row():
-                        start_btn = gr.Button("▶️ 开始训练", variant="primary", elem_classes="button-primary")
-                        stop_btn = gr.Button("⏹️ 停止训练", variant="stop", elem_classes="button-stop")
+                        start_btn = gr.Button("开始训练", variant="primary", elem_classes="button-primary")
+                        stop_btn = gr.Button("停止训练", variant="stop", elem_classes="button-stop")
 
-                    with gr.Accordion("🔧 高级选项 (Advanced)", open=False, elem_classes="accordion"):
+                    with gr.Accordion("高级选项 (Advanced)", open=False, elem_classes="accordion"):
                         with gr.Row():
                             grad_accum_steps = gr.Number(label="梯度累积 (grad_accum_steps)", value=1, precision=0)
                             num_workers = gr.Number(label="数据加载线程 (num_workers)", value=2, precision=0)
@@ -996,7 +1155,7 @@ with gr.Blocks(title="VoxCPM LoRA WebUI", theme=gr.themes.Soft(), css=custom_css
                             distribute = gr.Checkbox(label="分发模式 (distribute)", value=False)
 
                 with gr.Column(scale=2, elem_classes="form-section"):
-                    gr.Markdown("#### 📊 训练日志")
+                    gr.Markdown("#### 训练日志")
                     logs_out = gr.TextArea(
                         label="",
                         lines=20,
@@ -1060,41 +1219,79 @@ with gr.Blocks(title="VoxCPM LoRA WebUI", theme=gr.themes.Soft(), css=custom_css
             timer.tick(get_training_log, outputs=logs_out)
 
         # === Inference Tab ===
-        with gr.Tab("🎵 推理 (Inference)") as tab_infer:
+        with gr.Tab("推理 (Inference)") as tab_infer:
             gr.Markdown("""
-            ### 🎤 语音合成
+            ### 语音合成
             使用训练好的 LoRA 模型生成语音，支持 LoRA 微调和声音克隆
             """)
 
             with gr.Row():
                 # 左栏：输入配置 (35%)
                 with gr.Column(scale=35, elem_classes="form-section"):
-                    gr.Markdown("#### 📝 输入配置")
+                    gr.Markdown("#### 输入配置")
 
                     infer_text = gr.TextArea(
-                        label="💬 合成文本",
+                        label="合成文本",
                         value="Hello, this is a test of the VoxCPM LoRA model.",
                         elem_classes="input-field",
                         lines=4,
                         placeholder="输入要合成的文本内容...",
                     )
 
-                    gr.Markdown("**🎭 声音克隆（可选）**")
+                    gr.Markdown("**声音克隆（可选）**")
 
-                    prompt_wav = gr.Audio(label="🎵 参考音频", type="filepath", elem_classes="input-field")
+                    prompt_wav = gr.Audio(label="参考音频", type="filepath", elem_classes="input-field")
 
                     prompt_text = gr.Textbox(
-                        label="📝 参考文本（可选）",
+                        label="参考文本（可选）",
                         elem_classes="input-field",
-                        placeholder="如不填写，将自动识别参考音频内容",
+                        placeholder="如不填写且勾选极致克隆，将自动识别参考音频内容",
                     )
+
+                    use_prompt_text = gr.Checkbox(
+                        label="启用极致克隆（使用参考文本）",
+                        value=True,
+                        info="勾选：极致克隆（需参考音频+参考文本） | 取消：可控克隆（仅音色复刻）或风格设计",
+                    )
+
+                    control_instruction = gr.Textbox(
+                        label="风格/控制指令（可选）",
+                        elem_classes="input-field",
+                        placeholder="取消极致克隆后生效，如：'用温柔的语气说' 或 '悲伤地'",
+                        lines=2,
+                    )
+
+                    with gr.Accordion("高级选项（长文本/质量控制）", open=False):
+                        normalize_cb = gr.Checkbox(
+                            label="启用文本规范化 (normalize)",
+                            value=False,
+                            info="对标点/数字做标准化。官方默认 False",
+                        )
+                        retry_badcase_cb = gr.Checkbox(
+                            label="启用 badcase 重试 (retry_badcase)",
+                            value=True,
+                            info="检测到坏例自动重试。官方默认 True；若发现重试反而更糟可关闭",
+                        )
+                        seg_enabled_cb = gr.Checkbox(
+                            label="启用分段生成（长文本防糊）",
+                            value=False,
+                            info="按句号等标点切分后逐句生成，缓解 30s+ 长文本后半段漂移/嗡嗡",
+                        )
+                        seg_lookback_sl = gr.Slider(
+                            label="分段回看句数 (lookback)",
+                            minimum=0,
+                            maximum=5,
+                            value=1,
+                            step=1,
+                            info="0=仅切分不回看；1~5=回看前 N 句干净特征维持连贯性（V2 专属）",
+                        )
 
                 # 中栏：模型选择和参数配置 (35%)
                 with gr.Column(scale=35, elem_classes="form-section"):
-                    gr.Markdown("#### 🤖 模型选择")
+                    gr.Markdown("#### 模型选择")
 
                     lora_select = gr.Dropdown(
-                        label="🎯 LoRA 模型",
+                        label="LoRA 模型",
                         choices=["None"] + scan_lora_checkpoints(),
                         value="None",
                         interactive=True,
@@ -1102,12 +1299,12 @@ with gr.Blocks(title="VoxCPM LoRA WebUI", theme=gr.themes.Soft(), css=custom_css
                         info="选择训练好的 LoRA 模型，或选择 None 使用基础模型",
                     )
 
-                    refresh_lora_btn = gr.Button("🔄 刷新模型列表", elem_classes="button-refresh", size="sm")
+                    refresh_lora_btn = gr.Button("刷新模型列表", elem_classes="button-refresh", size="sm")
 
-                    gr.Markdown("#### ⚙️ 生成参数")
+                    gr.Markdown("#### 生成参数")
 
                     cfg_scale = gr.Slider(
-                        label="🎛️ CFG Scale",
+                        label="CFG Scale",
                         minimum=1.0,
                         maximum=5.0,
                         value=2.0,
@@ -1116,7 +1313,7 @@ with gr.Blocks(title="VoxCPM LoRA WebUI", theme=gr.themes.Soft(), css=custom_css
                     )
 
                     steps = gr.Slider(
-                        label="🔢 推理步数",
+                        label="推理步数",
                         minimum=1,
                         maximum=50,
                         value=10,
@@ -1124,15 +1321,23 @@ with gr.Blocks(title="VoxCPM LoRA WebUI", theme=gr.themes.Soft(), css=custom_css
                         info="生成质量与步数成正比，但耗时更长",
                     )
 
-                    generate_btn = gr.Button("🎵 生成音频", variant="primary", elem_classes="button-primary", size="lg")
+                    seed = gr.Number(
+                        label="随机种子",
+                        value=-1,
+                        precision=0,
+                        elem_classes="input-field",
+                        info="-1 为随机，固定值可复现结果",
+                    )
+
+                    generate_btn = gr.Button("生成音频", variant="primary", elem_classes="button-primary", size="lg")
 
                 # 右栏：生成结果 (30%)
                 with gr.Column(scale=30, elem_classes="form-section"):
-                    gr.Markdown("#### 🎧 生成结果")
+                    gr.Markdown("#### 生成结果")
 
                     audio_out = gr.Audio(label="", elem_classes="input-field", show_label=False)
 
-                    gr.Markdown("#### 📋 状态信息")
+                    gr.Markdown("#### 状态信息")
 
                     status_out = gr.Textbox(
                         label="",
@@ -1169,9 +1374,16 @@ with gr.Blocks(title="VoxCPM LoRA WebUI", theme=gr.themes.Soft(), css=custom_css
                     infer_text,
                     prompt_wav,
                     prompt_text,
+                    use_prompt_text,
+                    control_instruction,
                     lora_select,
                     cfg_scale,
                     steps,
+                    seed,
+                    normalize_cb,
+                    retry_badcase_cb,
+                    seg_enabled_cb,
+                    seg_lookback_sl,
                     train_pretrained_path,
                 ],
                 outputs=[audio_out, status_out],
@@ -1263,6 +1475,7 @@ with gr.Blocks(title="VoxCPM LoRA WebUI", theme=gr.themes.Soft(), css=custom_css
             gr.update(value=d["refresh"]),
             gr.update(label=d["cfg_scale"]),
             gr.update(label=d["infer_steps"]),
+            gr.update(label=d["seed"]),
             gr.update(value=d["gen_audio"]),
             gr.update(label=d["gen_output"]),
             gr.update(label=d["status"]),
@@ -1313,6 +1526,7 @@ with gr.Blocks(title="VoxCPM LoRA WebUI", theme=gr.themes.Soft(), css=custom_css
             refresh_lora_btn,
             cfg_scale,
             steps,
+            seed,
             generate_btn,
             audio_out,
             status_out,

@@ -4,7 +4,22 @@ voxcpm.egg-info
 .DS_Store
 ./pretrained_models/
 app_local.py
+
+# Local model weights and downloaded checkpoints
 models/
+ap_bwe_checkpoints/
+*.safetensors
+*.pth
+*.pt
+*.ckpt
+
+# Local LoRA training inputs and outputs
 lora/
 lora_train_data/
-ap_bwe_checkpoints/
+runs/
+wandb/
+*.tfevents.*
+
+# Local backups and reference papers
+backup_before_upgrade_*/
+VoxCPM_*.pdf
